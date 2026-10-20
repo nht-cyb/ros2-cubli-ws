@@ -1,563 +1,446 @@
-# Cubli control (ROS 2 Jazzy)
+# Cubli 3D (ROS 2 Jazzy)
 
-Cubli control in ROS 2 for the **1D Cubli**: a cube that jumps up from lying on a face and
-balances on one edge with a single reaction wheel.
+A 15 cm cube with three reaction wheels. Lying flat on a face, it **jumps onto an edge,
+balances there, jumps onto a corner and balances on the corner**, using only its wheels
+and their brakes.
 
-| Phase | What | Status |
+![3D Cubli: lying on a face, jumping onto an edge, then onto the corner, then pushed](media/cubli3d_jump_up.gif)
+
+*Simulation with all noise sources on. It lies on a face (gyro calibration), spins the
+x wheel up and brakes it, and lands balanced on the edge. While still balancing on the
+edge, it spins the y and z wheels up and brakes both, and swings up onto the corner. Then
+it is pushed. Right: the centre-of-mass height (face 66 mm, edge 93 mm, corner 114 mm)
+and the three wheel speeds. Played at 2× speed.*
+
+| Stage | What | Status |
 |---|---|---|
-| 1 | Simulator, jump-up + LQR controller, RViz | ✅ done in simulation |
-| 2 | Realistic sensors (MPU6050 IMU + encoder) and a state estimator | ✅ done in simulation |
-| 3 | Real hardware: ESP32 + MPU6050 + Nidec 24H firmware and ROS driver | 🚧 software ready and tested against a fake ESP32; not yet run on a real cube |
+| 1D Cubli | One wheel: jump-up and balance on an edge, sensor models and estimator, ESP32 firmware and ROS driver | ✅ done, see **[nht-cyb/ros2-1dim-balancing-cube](https://github.com/nht-cyb/ros2-1dim-balancing-cube)** |
+| 3D model | Corner dynamics, floor contact (face / edge / corner), brakes, Nidec motors | ✅ simulation |
+| Edge balance | Balancing on an edge with the wheel along it, while the other two wheels prepare the next jump | ✅ simulation |
+| Face → edge | Spin up, brake, energy-controlled flight, LQR catch | ✅ simulation |
+| Edge → corner | Two wheels braked at once, energy-controlled flight, 3D LQR catch and corner balance | ✅ simulation |
+| Noise | ICM-42688 IMU, encoders, motor torque error and ripple, lossy brakes (learned online) | ✅ simulation |
+| Hardware | ESP32 with three Nidec channels and brakes, ICM-42688 over SPI, on-board balance loop | 🚧 next |
 
-The same estimator and controller run on the simulator and on the real cube; only the
-node that produces the raw sensor data changes.
+Everything below is about the 3D cube; the 1D results live in the repository linked above.
 
-## Phase 1 results: 1D jump-up and edge balancing (simulation)
+## Contents
 
-![Cubli jump-up and balance demo](media/cubli_demo.gif)
+1. [Hardware being modelled](#1-hardware-being-modelled)
+2. [Mathematical model](#2-mathematical-model)
+3. [Balancing on an edge](#3-balancing-on-an-edge-with-3-motors)
+4. [Jump-up: face → edge](#4-jump-up-face--edge)
+5. [Jump-up: edge → corner, and corner balance](#5-jump-up-edge--corner-and-corner-balance)
+6. [Sensors, hardware noise and estimation](#6-sensors-hardware-noise-and-estimation)
+7. [Results](#7-results)
+8. [How to run](#8-how-to-run)
+9. [Project layout](#9-project-layout)
 
-*Recorded from a live `ros2 launch` run (sim + controller nodes at 200 Hz): the cube jumps up
-from a face, balances, is pushed over (6 rad/s), then jumps back up from the other side.*
+## 1. Hardware being modelled
 
-![Cubli in RViz: jump-up, then pushed over and jumping back up twice](media/cubli_rviz.gif)
-
-*Screen recording of RViz during `ros2 launch cubli_control cubli_sim.launch.py`, cropped to the
-3D view and trimmed: the first jump-up from a face, then two knock-overs with
-`ros2 topic pub --once /cubli/push std_msgs/msg/Float64 "{data: 6.0}"`, each followed by an
-automatic jump back up.*
-
-**Jump-up** (both directions measured from the run above, first-try success each time)
-
-| Metric | Result |
-|---|---|
-| Wheel spin-up (0.03 N·m) | 1.54 s from rest (1.82 s when the wheel first has to reverse) |
-| Wheel speed at brake | ±74.0 rad/s (ideal 68.1 rad/s × 1.1 margin) |
-| Body rate right after brake | ±6.82 rad/s |
-| Brake → LQR engaged (tilt < 11.5°) | 0.13 s |
-| Brake → tilt within ±1° | 0.43 s |
-| Peak balancing torque | 0.08 N·m (32% of the 0.25 N·m limit) |
-| Tilt 2 s after catch | 0.17°; the wheel spins down slowly (3.2 rad/s left) |
-
-**Balancing robustness** (offline sweeps of the same model and controller)
-
-| Test | Result |
-|---|---|
-| Recovers from a tilt at rest | up to 11.2°, the controller's engage limit (0.2 rad) |
-| Absorbs a push without falling | up to 4.1 rad/s; 5 rad/s and above knock it over, then it jumps back up |
-| Lossy brake (`brake_efficiency`) | ≥ 0.95 succeeds on the first jump; 0.90 succeeds on the retry (margin 1.15) |
-| Sample delay | stable with one control step (5 ms) of actuation delay |
-
-**Controller:** discrete LQR (200 Hz) on [θ_b, θ̇_b, θ̇_w] with Q = diag(100, 1, 1e-4),
-R = 100, which gives K = [−1.615, −0.162, −0.001]. The open-loop upright pole is +9.86 rad/s;
-the closed-loop discrete poles have magnitudes 0.891, 0.951 and 0.996, the slowest being the
-wheel-speed mode.
-
-**Verification:** 13 offline tests pass (`pytest`), covering open-loop instability,
-closed-loop stability, tilt recovery, brake momentum conservation, floor contact, and jump-up
-from both faces. The full sequence was also checked live through `ros2 launch`.
-
-**Limitations of Phase 1:** simulation only, with perfect state feedback (no IMU noise,
-bias or filtering), an ideal instantaneous brake, and the paper's parameters rather than
-measured ones. The GIFs above were recorded with perfect state; to reproduce them, launch with
-`sensors:=false`.
-
-## Phase 2: sensors and state estimation (simulation)
-
-The controller no longer sees the true state. The simulator now outputs what the real
-sensors would, and a new estimator node rebuilds `/joint_states` from them:
-
-![Phase 2: estimated vs true tilt through a jump, a knock-over and a second jump](media/phase2_estimator.gif)
-
-*Simulation with sensors on: the controller only sees the blue estimate. The estimate stays
-on top of the true tilt. The error (bottom) peaks at about 2.5° for an instant during each
-jump and falls back to a few tenths of a degree once
-the cube is balancing (0.22° RMS in this run, settling included).*
-
-- **IMU (MPU6050 model)** at the cube centre, 106 mm from the edge: gyro noise 0.003 rad/s and
-  bias 0.02 rad/s (~1.1°/s); accelerometer noise 0.04 m/s² and biases of 0.03 and −0.05 m/s².
-  The accelerometer also feels the cube's own centripetal and tangential acceleration.
-- **Wheel encoder:** quantised to 400 counts per turn.
-- **Estimator** ([estimator.py](src/cubli_control/cubli_control/estimator.py)):
-  - Gyro-bias calibration while the cube lies still for its first second.
-  - A complementary filter (time constant 0.5 s since tuning; 0.3 s for the results below) that integrates the gyro and corrects the
-    tilt with the accelerometer. The accelerometer reading is lever-arm compensated, and the
-    correction is skipped during jumps and impacts.
-  - Wheel speed from encoder differences over 40 ms.
-
-**Results** (measured through `ros2 launch`, with estimates compared to the sim's ground truth)
-
-| Metric | Result |
-|---|---|
-| Gyro bias found by calibration | +0.0202 rad/s (true +0.0200) |
-| Starting tilt from calibration | −45.09° (true −45.00°) |
-| Jump-up, knock-over, jump-up again | both jumps succeed first try |
-| Tilt estimate error while balancing | +0.175° mean, 0.024° std |
-| Body-rate / wheel-speed error (std) | 0.003 rad/s / 0.17 rad/s |
-
-The constant +0.175° tilt error is the accelerometer's 0.03 m/s² bias (0.03/9.81 rad). The
-controller handles it without help: the wheel settles at a few rad/s and keeps the *true*
-tilt near 0°. On hardware, measure this offset and set `angle_offset`.
-
-**Robustness** (offline, 3 random seeds each, jump-up from a face then balance; all passed with
-no failed jumps or falls)
-
-| Sensor case | Tilt error (mean / std) |
-|---|---|
-| Default sensors | 0.17° / 0.05° |
-| 3× gyro and accelerometer noise | 0.21° / 0.07° |
-| Large biases (gyro 0.15 rad/s, accelerometer 0.3 m/s²) | 1.77° / 0.09° |
-| Coarse encoder (100 counts per turn) | 0.17° / 0.05° |
-| IMU 3 cm from the edge instead of 10.6 cm | 0.18° / 0.04° |
-| All of the bad cases combined | 1.79° / 0.07° |
-
-A filter time constant of 0.2–0.5 s works best; above 1 s, uncorrected gyro drift starts to
-show (0.13° std at 1 s, 0.24° at 2 s).
-
-## Phase 3: ESP32 + MPU6050 + Nidec 24H hardware
-
-```
- MPU6050 ─I2C─┐                       USB serial, 460800 baud
- Nidec 24H ───┤ ESP32 firmware ◄──────────────────────────► hw_driver_node ─► estimator ─► controller
- (PWM/DIR/    │ 200 Hz frames               $S,... sensor frames  /imu/data_raw       /joint_states
-  brake/enc) ─┘ 100 ms watchdog             $T,$B,$E commands     /cubli/wheel_encoder
-```
-
-- **Firmware:** [firmware/cubli_esp32/cubli_esp32.ino](firmware/cubli_esp32/cubli_esp32.ino)
-  needs only the ESP32 Arduino core (2.x or 3.x). It reads the MPU6050 directly over I2C
-  (±500°/s, ±2 g, 44 Hz low-pass) and counts the encoder with interrupts. It drives the
-  Nidec's inverted PWM, direction and brake pins, and stops the motor if commands stop for
-  100 ms. The motor starts disabled until the driver connects.
-- **Driver:** [hw_driver_node.py](src/cubli_control/cubli_control/hw_driver_node.py)
-  publishes the same raw topics as the simulator. It remaps the IMU axes to the body frame
-  and stamps frames with the ESP32's clock, so the estimator gets jitter-free timing. It turns
-  torque into Nidec effort with a DC-motor model that includes back-EMF, and reconnects on
-  its own if the USB cable is unplugged.
-- **Protocol:** ASCII lines with an NMEA-style XOR checksum; corrupt lines are dropped. See
-  [hardware.py](src/cubli_control/cubli_control/hardware.py).
-- **Fake ESP32:** `fake_esp32` runs the Phase 2 physics and sensor models behind a virtual
-  serial port and speaks the same protocol. This tests the whole hardware path without a board.
-
-**Tested without hardware:** the full chain (fake ESP32 → serial → driver → estimator →
-controller) ran at 199 frames/s with 0 bad lines, one frame every 5 ms (see the serial-read fix
-under *Controller tuning*). With `jump_up:=true` it jumped up, balanced,
-was knocked over (`kill -USR1 <fake_esp32 pid>`), and jumped back up. Ctrl+C shuts every node
-down cleanly. The firmware passes a g++ syntax check against Arduino API stubs for ESP32 core
-2.x and 3.x, but has **not been compiled for an ESP32 or run on a board**.
-
-### Wiring (defaults; change the constants at the top of the sketch)
-
-| ESP32 pin | Connects to | Notes |
+| Part | Model in the simulation | Notes |
 |---|---|---|
-| GPIO 21 / 22 | MPU6050 SDA / SCL | 3.3 V, I2C at 400 kHz |
-| GPIO 25 | Nidec PWM | inverted: 100% duty = stopped |
-| GPIO 26 | Nidec CW/CCW | |
-| GPIO 27 | Nidec START/STOP (brake) | `BRAKE_ACTIVE = LOW`; check your motor |
-| GPIO 32 / 33 | Nidec encoder A / B | internal pull-ups to 3.3 V; don't pull up to 5 V |
-| GPIO 13 (optional) | brake servo signal | set `PIN_SERVO = 13` |
-| GND | Nidec GND, MPU6050 GND | shared ground with the motor supply |
+| Frame | 15 cm cube, 0.75 kg (frame, electronics, battery, motor stators) | MEASURE |
+| Wheels | 3 × 0.204 kg, axial inertia I_w = 0.57·10⁻³ kg·m², radius 58 mm, 10 mm thick | MEASURE |
+| Motors | 3 × Nidec 24H: stall torque 0.10 N·m, no-load speed 600 rad/s, limited to 0.08 N·m | MEASURE |
+| Brakes | one per wheel, hands over a fraction η ≈ 0.92 ± 0.02 of the wheel's momentum | MEASURE |
+| IMU | one ICM-42688-class IMU at the cube centre | datasheet noise |
+| Encoders | Nidec built-in, 100 PPR × 4 = 400 counts per turn | |
+| Total | **M = 1.36 kg** | |
 
-Power the Nidec from its own 12 V (or 24 V, depending on the model) supply, not from the ESP32.
-Mount the MPU6050 so one axis lies along the balancing edge.
+**Wheel placement.** Wheel *i* spins about body axis *i*. Its centre sits 63 mm from the
+cube centre, towards the face at the pivot corner. Two orthogonal wheels only miss each
+other if this offset is larger than the wheel radius, so three 58 mm wheels clear each
+other by 5 mm (checked by a test). All values are in `Cubli3DParams`
+([model3d.py](src/cubli_control/cubli_control/model3d.py)).
 
-### Bring-up
+## 2. Mathematical model
 
-1. Give your user serial-port access once (then log out and back in):
-   ```bash
-   sudo usermod -aG dialout $USER
-   ```
-2. Flash the sketch with the Arduino IDE: install the ESP32 boards package, pick your board,
-   open `firmware/cubli_esp32/cubli_esp32.ino` and upload it.
-3. **Sensors only:** run the driver without the controller, then tilt the cube by hand.
-   ```bash
-   ros2 launch cubli_control cubli_hw.launch.py controller:=false
-   ```
-   Check `/imu/data_raw`: the edge-axis gyro should read positive when the tilt (body
-   `/joint_states` position) increases. Fix `imu_axes` in
-   [cubli_hw.yaml](src/cubli_control/config/cubli_hw.yaml) until it does. Then check that
-   positive effort (`/cubli/raw_effort`, below) makes the encoder count up; if not, set
-   `encoder_sign: -1`.
-4. **Measure** the values marked `MEASURE` in `cubli_hw.yaml`:
-   - `encoder_cpr`: turn the wheel exactly once by hand.
-   - `no_load_speed` and `stall_torque`: hold the cube and drive the motor directly
-     (the driver's watchdog needs commands at least every 100 ms, hence `-r 50`):
-     ```bash
-     ros2 topic pub -r 50 /cubli/raw_effort std_msgs/msg/Float64 "{data: 0.3}"
-     ```
-     Plot `/cubli/wheel_encoder` or the wheel speed in `/joint_states`. Then
-     no_load_speed = steady speed / 0.3, and stall_torque = Θ_w × (starting acceleration) / 0.3.
-   - `angle_offset`: balance the cube by hand and read the estimated tilt.
-   - Also measure the real masses and inertias and put them in `CubliParams` in
-     [model.py](src/cubli_control/cubli_control/model.py), so the LQR is designed for your cube.
-5. **Balance:** keep the cube still on a face for the first second (gyro calibration), then
-   lift it to within about 11° of balanced. The controller takes over.
-   ```bash
-   ros2 launch cubli_control cubli_hw.launch.py
-   ```
-   For a balance loop that doesn't depend on the PC, add `onboard:=true` (see below).
+### 2.1 Frames and state
 
-**About jump-up on hardware:** jumping needs the wheel stopped almost instantly. The Nidec's
-built-in brake is electrical and much too slow, so jump-up is off on hardware by default.
-To try it, add a servo-driven mechanical brake (`PIN_SERVO`), then launch with
-`jump_up:=true`. If the jumps fall short, the controller raises the wheel speed by 5% per try.
+- **Body frame B:** origin at the pivot corner, axes **e₁ e₂ e₃** along the three cube
+  edges that meet there. The cube fills [0, s]³ with s = 0.15 m. The three neighbour
+  vertices are **v**ᵢ = s **e**ᵢ.
+- **State** (13): attitude quaternion **q** (B → world), body rate **ω** (in B), wheel speeds
+  relative to the body **ω_w**, and wheel angles **θ_w**.
+- **Input:** wheel torques **T**; the body feels −**T**.
+- **Up vector:** **u** = Rᵀ **e**_z is world "up" seen from the body. Vertex *i* is at
+  height s·uᵢ, so **u** alone tells which vertices touch the floor.
 
-Try the hardware stack with no board:
-```bash
-ros2 launch cubli_control cubli_hw.launch.py fake_hardware:=true jump_up:=true
-```
+| Geometry | Value |
+|---|---|
+| Centre of mass **r** (pivot → CoM) | 0.0656 (1, 1, 1) m, on the body diagonal; ‖**r**‖ = 0.114 m |
+| Inertia about the pivot, wheels locked: Θ | 0.0170 on the diagonal, −0.0057 off it [kg·m²] |
+| Θ₀ = Θ − I_w 𝟙 (wheels spinning freely) | |
 
-### On-board balance mode (balance loop on the ESP32)
+### 2.2 Equations of motion (on the corner)
 
-By default the PC closes the balance loop: every 5 ms a sensor frame goes over USB to the
-driver, the estimator and the controller, and a torque command comes back. If the PC is
-busy, that round trip gets late and catches fail (see *Result under load* below). In
-on-board mode **the ESP32 runs the estimator and the LQR itself at 200 Hz** and drives the
-motor straight from each IMU sample. USB and the PC are out of the time-critical loop.
+The angular momentum about the pivot is **L** = Θ**ω** + I_w**ω_w**. Euler's equation about
+the fixed pivot, and the axial momentum of each wheel, give (after Muehlebach &
+D'Andrea, *Nonlinear Analysis and Control of a Reaction-Wheel-Based 3-D Inverted
+Pendulum*, IEEE TCST 2017):
 
-- **Estimator on the ESP32:** the same algorithm as
-  [estimator.py](src/cubli_control/cubli_control/estimator.py): gyro-bias calibration over
-  the first still second, a complementary filter (τ = 0.5 s) with lever-arm compensation
-  (IMU 0.106 m from the edge), and wheel speed from an 8-sample encoder difference.
-- **LQR on the ESP32:** u = −K [tilt, rate, wheel speed], limited to `max_torque`, then
-  turned into Nidec effort with the same back-EMF model as the driver. It uses the same
-  hysteresis as the PC controller. It takes over within `engage_angle`, or within
-  `catch_angle` for `jump_timeout` after a brake pulse (the jump). It gives up beyond
-  `disengage_angle` while still moving away from upright, or beyond `catch_angle`.
-- **What stays on the PC:** the jump-up state machine (rest, spin-up, brake) and
-  supervision. While the ESP32 is not balancing it applies the PC's `$T` commands as usual
-  (spin-up). While it balances it ignores them. The controller's BALANCE mode then simply
-  follows what the ESP32 reports.
-- **Setup on connect:** the driver designs K with `lqr_gain` from the `cubli_controller`
-  weights in [cubli_hw.yaml](src/cubli_control/config/cubli_hw.yaml). It sends K, the angles,
-  motor and estimator parameters, and the IMU axes, then switches the ESP32 to on-board mode.
-  Both loops therefore always use the same tuning. If the ESP32 resets by itself (e.g. a
-  brownout), the driver notices that the estimates stopped and sends the setup again.
-  `lqr_delay_steps` is ignored on board: there is no transport delay left to model.
-- **Safety:** the motor still starts disabled until `$E,1`. If no valid line arrives from the
-  PC for 2 s (the driver sends one at least every 100 ms), the ESP32 stops balancing and
-  stops the motor. If an IMU read fails, it stops balancing.
-- **Topics:** the ESP32's estimate replaces the estimator node on `/joint_states` (the
-  launch file doesn't start the estimator in this mode). Its mode is published on
-  `/cubli/onboard_mode` (`CALIBRATING`, `IDLE`, `BALANCE`, latched). `/cubli/mode` is still
-  the controller's overall mode (FALLEN → SPIN_UP → JUMPING → BALANCE), and its BALANCE
-  now comes from the ESP32. The raw `/imu/data_raw` and `/cubli/wheel_encoder` keep flowing
-  for plotting.
+  Θ₀ **ω̇** = **h**,  **h** = −**ω** × **L** + M **r** × **g**_B − c_b **ω** − (**T** − c_w **ω_w**)
 
-**Protocol additions** (details in [hardware.py](src/cubli_control/cubli_control/hardware.py)
-and the sketch header):
+  I_w (**ω̇** + **ω̇_w**) = **T** − c_w **ω_w**,  **q̇** = ½ **q** ⊗ (0, **ω**)
 
-| Direction | Message | Meaning |
+- **g**_B = −g**u** is gravity in the body frame.
+- c_b, c_w are the pivot and wheel-bearing friction.
+- The wheel equation is exact for symmetric wheels: the gyroscopic term has no component
+  along a wheel's own axis.
+
+### 2.3 Floor contact: face, edge or corner
+
+The cube always pivots on the same corner. The **contact set** C ⊆ {1, 2, 3} is the set of
+neighbour vertices on the floor, and it selects the dynamics:
+
+| C | Pose | Body dynamics |
 |---|---|---|
-| PC → ESP32 | `$M,<0\|1>` | 0 = passthrough (default), 1 = on-board balance; 1 restarts calibration |
-| PC → ESP32 | `$K,<k1>,<k2>,<k3>` | LQR gain |
-| PC → ESP32 | `$P,<name>,<value>` | `engage`, `disengage`, `catch`, `jump_timeout`, `max_torque`, `stall_torque`, `no_load_speed`, `max_effort`, `angle_offset`, `tau`, `imu_offset`, `cpr`, `enc_sign` |
-| PC → ESP32 | `$A,<ax>,<ay>,<az>` | body axes from sensor axes (same as `imu_axes`), e.g. `$A,+x,-z,+y` |
-| ESP32 → PC | `$X,<t_us>,<tilt>,<rate>,<wheel_speed>,<torque>,<mode>` | on-board estimate after every `$S`; mode 1 calibrating, 2 idle, 3 balancing |
+| ∅ | on the corner | Θ₀ **ω̇** = **h** (free rotation about the pivot) |
+| {i} | on edge i | **ω** = φ̇ **e**ᵢ, with Θ₀,ᵢᵢ φ̈ = hᵢ (the contact forces have no moment about the edge line) |
+| {i, j} | lying on a face | **ω** = 0 |
 
-`$S` frames keep streaming unchanged. Together with `$X`, the link carries about 24 kB/s,
-about half of what 460800 baud allows.
+The wheels always follow **ω̇_w** = (**T** − c_w **ω_w**)/I_w − **ω̇**.
 
-#### How to run it
+- **Contact torque and normal force.** The floor's torque about the pivot is
+  **τ**_c = Θ₀ **ω̇** − **h**. The vertical force on vertex *i* is then
+  Nᵢ = **u** · ((**τ**_c / s) × **e**ᵢ).
+- **Lift-off:** if Nᵢ < 0 (the floor would have to pull), vertex *i* leaves the contact set.
+- **Landing** is inelastic. When vertex *i* reaches the floor, only the angular momentum
+  about the new contact edge survives: φ̇⁺ = (Θ **ω**⁻)ᵢ / Θᵢᵢ. Landing on a face stops the
+  body.
+- A cube falling off the corner always lands on one of the three edges through the pivot,
+  at 35.26° of tilt. A cube falling off an edge lands on a face at ±45°.
 
-On-board mode is off by default. Turn it on with `onboard:=true`; all other launch arguments
-work as before.
+The simulator integrates this with RK4 at 200 Hz. Tests check that it conserves energy on
+an edge (10⁻⁸) and keeps the momentum about the landing edge. Code:
+[contact3d.py](src/cubli_control/cubli_control/contact3d.py).
 
-1. **Without a board (fake ESP32)**, from `cubli_ws`:
-   ```bash
-   colcon build --symlink-install
-   source install/setup.bash
-   ros2 launch cubli_control cubli_hw.launch.py fake_hardware:=true onboard:=true jump_up:=true
-   ```
-   In the log you should see `On-board balance: K = [...] sent to the ESP32`, then
-   `ESP32 on-board mode: CALIBRATING` → `IDLE`. The controller spins up and brakes. The
-   fake prints `on-board mode BALANCE (true tilt ...)` when the ESP32 catches the cube, and
-   the controller logs `BALANCE caught`.
-2. **Watch it** in a second terminal (after `source install/setup.bash`):
-   ```bash
-   ros2 topic echo /cubli/onboard_mode
-   ```
-   ```bash
-   ros2 topic echo /cubli/mode
-   ```
-   ```bash
-   ros2 run rqt_plot rqt_plot /joint_states/position[0] /joint_states/velocity[1]
-   ```
-3. **Knock it over:** the fake prints its pid at start-up (`Fake ESP32 on ... (pid N)`).
-   Send it a push with `kill -USR1 N` (or `-USR2` for the other way). The cube falls, lies
-   still for 1 s, and jumps back up.
-4. **On the real cube**, after the bring-up steps above (axes, encoder sign, measured motor
-   constants, `angle_offset`), flash the updated sketch and run:
-   ```bash
-   ros2 launch cubli_control cubli_hw.launch.py onboard:=true
-   ```
-   Keep the cube still on a face until `/cubli/onboard_mode` says `IDLE` (calibration).
-   Then lift it to within `engage_angle` (about 7°); the ESP32 takes over. Add
-   `jump_up:=true` once you have a mechanical brake. To go back to the PC loop, launch
-   without `onboard:=true`. The driver switches the ESP32 back to passthrough when it shuts
-   down, and a power cycle does the same.
-5. **Change the tuning** in `cubli_hw.yaml` (`cubli_controller` and `cubli_estimator`
-   sections) and restart the launch. The driver sends the new values on connect.
+### 2.4 Brakes
 
-#### Measured (fake ESP32, 8 cores, 30 s per run, knocked over 4 s after each catch)
+Braking wheels B ⊆ {1, 2, 3} is an impulse. Their momentum I_w ω_w,j goes to the body,
+times the brake efficiency η:
 
-![Phase 3: PC loop vs on-board loop under full CPU load](media/phase3_onboard_vs_pc.gif)
+  Θ **ω**⁺ = Θ **ω**⁻ + η I_w Σⱼ∈B ω_w,j **e**ⱼ,  ω_w,j⁺ = 0
 
-*Same fake hardware, same jump-up, all 8 CPU cores busy, played at 2× speed. Left: the PC
-closes the loop and loses the cube right after each catch, so it never gets to be knocked
-over. Right: the ESP32 closes the loop and holds every catch; it is knocked over 3 times and
-jumps back up each time. Purple lines mark pushes, red lines mark brake pulses (jumps).
-This is a separate recording from the table below, and it came out the same way.*
+Then the contact set decides: a vertex whose new velocity points upwards lifts off, and
+the rest constrain **ω**⁺ (projected onto the remaining edge, or zero on a face). After the
+impulse the wheel is free again and keeps spinning with the body. So only ½Θ₀φ̇² is left to
+lift the cube, not ½Θφ̇². This sets the jump speeds below.
 
-| Run | Jumps | Caught and held | Falls without a push | `/joint_states` gap p95 / max |
-|---|---|---|---|---|
-| On-board, idle PC | 4 | 4 of 4 | 0 | 5.5 / 21 ms |
-| **On-board, 8 of 8 cores at 100%** | 4 | **4 of 4** | **0** | 13.5 / 51 ms |
-| Passthrough (PC loop), 8 of 8 cores at 100% | 6 | 0 of 6 (5 caught, all lost within 0.1–3.3 s; 1 fell short) | 5 | 11.7 / 37 ms |
+### 2.5 Motors
 
-With on-board mode, every knock-over ended back on the edge, even under full load. All the
-brakes fired at 74.6–75.4 rad/s, and the fake ended the runs within 0.05° of upright. Under
-the same load the PC loop never held a catch, and that run ended with the cube lying down.
-Results under full load vary from run to run; the earlier passthrough run in *Result under
-load* below was luckier.
+Each Nidec motor gives at most the torque its effort range allows at the current wheel
+speed (back-EMF), and the controller limits it further to 0.08 N·m:
 
-How the port was checked:
+  τ_stall (−1 − ω_w/ω₀) ≤ T ≤ τ_stall (1 − ω_w/ω₀)
 
-- The sketch passes `g++ -fsyntax-only -Wall -Wextra` against Arduino stubs for ESP32 core
-  2.x and 3.x, with no warnings.
-- The sketch was compiled for the PC with working stubs and fed the same 12 s of sensor
-  data as the Python twin ([onboard.py](src/cubli_control/cubli_control/onboard.py), which
-  the fake ESP32 runs). The data covered calibration, a catch, a push and a fall. Over 2400
-  steps the modes matched exactly, and the motor effort agreed to within 1.5·10⁻⁶.
+## 3. Balancing on an edge with 3 motors
 
-**Caveat:** the fake ESP32 runs its physics and its on-board loop in the same Python
-process, in lockstep. PC load can slow it down, but it can never make the loop late. So
-these runs show that the PC side no longer matters. They don't show that the firmware meets
-its 5 ms deadline on a real ESP32. That is very likely (a few hundred float operations per
-step), but it has **not been measured on a board**.
+On edge *i* only rotation about **e**ᵢ is free, so **only wheel *i* can balance the cube**.
+The two wheels perpendicular to the edge push their reaction torques into the floor. They
+are used to hold their speed, or to store momentum for the next jump (section 5).
 
-## Controller tuning: smoother control, smaller tilt error
+Write **r**⊥ = **r** − (**r**·**e**ᵢ)**e**ᵢ (the CoM offset from the edge, ‖**r**⊥‖ = 92.7 mm) and
+**n** = **e**ᵢ × **r̂**⊥. The edge tilt φ is defined by **u** = cos φ **r̂**⊥ − sin φ **n**, so
+φ̇ = ωᵢ. With this, the edge dynamics are exactly a 1D Cubli:
 
-Goal: keep the cube as close to its balance point as possible, with smooth torque, and make
-it robust to the delays a real PC + USB link adds. Everything below was measured with
-[scripts/tune_controller.py](scripts/tune_controller.py),
-[scripts/confirm_tuning.py](scripts/confirm_tuning.py) and
-[scripts/tune_catch.py](scripts/tune_catch.py) (raw output in [tuning/](tuning/)). Both
-simulate the full Phase 2 loop: noisy sensors, the estimator, 1–3 steps (5–15 ms) of control
-delay plus 0–2 steps of random jitter, a random disturbance torque (0.003 N·m), and a push.
+  Θ₀,ᵢᵢ φ̈ = M g ‖**r**⊥‖ sin φ − c_b φ̇ − (Tᵢ − c_w ω_w,i)
 
-**1. LQR weights and filter.** A sweep of 324 tunings, then the best candidates re-run with
-60 runs each (mean ± 95% confidence interval):
+  ω̇_w,i = (Tᵢ − c_w ω_w,i)/I_w − φ̈
 
-| Tuning | Tilt error (RMS) | Torque jitter (RMS step) | Push peak | Settle |
-|---|---|---|---|---|
-| Before: Q = (100, 1, 1e-4), filter 0.3 s | 0.066 ± 0.003° | 1.020 ± 0.018 mN·m | 2.30° | 0.71 s |
-| **After: Q = (100, 0.3, 1e-4), filter 0.5 s** | **0.061 ± 0.003°** | **0.837 ± 0.010 mN·m** | 2.41° | 0.77 s |
-| Delay-aware LQR (1 step), same weights | 0.063 ± 0.003° | 0.876 ± 0.009 mN·m | 2.45° | 0.81 s |
+- **Open loop:** unstable, with a pole at +8.64 rad/s.
+- **Controller:** a discrete LQR on [φ, φ̇, ω_w,i] with Q = diag(100, 0.3, 10⁻⁴) and R = 100
+  gives K = [−3.18, −0.353, −0.0010].
+- **Engaging and giving up:** it takes over within `edge_catch` = 0.4 rad of balance if the
+  cube is moving towards balance. It gives up beyond 0.16 rad while still tipping further.
+- **The motor limits it.** Gravity's stiffness about the edge is M g ‖**r**⊥‖ = 1.24 N·m/rad,
+  so 0.08 N·m holds at most **3.7°**. With all the noise on, it recovers from a 3° start but
+  not from 3.5°.
 
-The new tuning has 8% less tilt error and 18% smoother torque, at the cost of a 5% larger
-peak after a push. It was best under the hardware torque limit too (0.061° and 0.838 mN·m
-there). The remaining ~0.06° is the sensor-noise floor; no choice of weights got much below
-it. The previous tuning was already robust to 11 steps (55 ms) of delay, which is why the
-delay-aware LQR (`lqr_delay_steps`) didn't help; it stays available but off.
+## 4. Jump-up: face → edge
 
-**2. Catching the cube after a jump.** The LQR used to take over only once the cube was
-nearly upright, and it gave up as soon as the tilt passed a fixed limit. Under the hardware
-torque limit (0.08 N·m) the catch then only worked at one exact jump speed. The controller
-now takes over at `catch_angle` (0.4 rad) during a jump, early enough to slow the cube down,
-and it gives up only past `disengage_angle` *while still moving away* from upright.
-Results under the hardware torque limit (% of 20 jumps per case that ended balanced):
+Lying on the face spanned by **e**ᵢ and **e**ⱼ, the cube jumps onto edge *i* by spinning
+wheel *i* and braking it.
 
-| Catch rule | Jump margin 1.03 | 1.05 | 1.10 | 1.15 |
-|---|---|---|---|---|
-| Before: take over at 0.12 rad, give up at 0.16 | 0% | 0% | 100% | 0% |
-| **After: take over at 0.4 rad, give up only moving away** | **100%** | **100%** | **100%** | **100%** |
+1. **Required wheel speed.** The CoM has to rise from rᵤ (its height on the face) to
+   ‖**r**⊥‖: ΔE = M g (‖**r**⊥‖ − rᵤ) = 0.363 J. The brake gives φ̇₀ = I_w ω_w / Θᵢᵢ, of which
+   ½Θ₀,ᵢᵢφ̇₀² is usable, so
 
-That held with up to 4 steps (20 ms) of delay plus jitter, except 1.15 with take-over at
-0.3 rad (60%). The simulator profile succeeded in every case with the new rule.
+     ω_w = (Θᵢᵢ / I_w) √(2 ΔE / Θ₀,ᵢᵢ) = **198 rad/s** (lossless)
 
-**3. Fixes found while testing under CPU load** (your RViz run showed jumps going wrong):
+   The target is margin × 198 / η̂, i.e. 229 rad/s with the default margin of 1.04 and a
+   first efficiency guess of η̂ = 0.9.
+2. **Spin-up:** a speed loop limited to 0.03 N·m. Its reaction torque presses the cube into
+   the floor, so it stays put (the contact model checks this). The brake fires only once
+   the speed has held within ±2 rad/s for 0.15 s.
+3. **Flight energy control.** Between the brake and the top, the energy about the edge is
+   E = ½ Θ₀,ᵢᵢ φ̇² + M g ‖**r**⊥‖ cos φ, and only the motor changes it: Ė = −Tᵢ φ̇. So
+   during the flight
 
-- **Serial bursts (a driver bug that would affect real hardware too):** the driver read 512
-  bytes at a time, so it waited for about 6 frames and handed the controller data up to 30 ms
-  old in bursts. It now reads whatever has arrived. The 95th-percentile gap between
-  `/joint_states` messages dropped from 38 ms to 5.5 ms at idle, and to 9.5 ms with every CPU
-  core busy.
-- **Brake timing:** the controller braked the moment one reading came within 1 rad/s of the
-  target, so late or bursty data fired the brake at 33–90 rad/s instead of ~75. It now brakes
-  once the speed has held within 2 rad/s for 0.15 s. Every brake since then was at
-  73.2–75.1 rad/s.
-- **Mode flicker:** BALANCE/FALLEN switched hundreds of times at the engage limit. The
-  give-up rule above removed it.
-- **Fake ESP32 clock:** it now stamps frames with simulated time, like a real ESP32's timer.
+     Tᵢ = sat(k_E (E − E*) φ̇),  E* = M g ‖**r**⊥‖
 
-**Result under load** (hardware path with the fake ESP32, jump-up, knocked over after 3 s
-balanced):
+   steers the cube to arrive at balance with no speed left. With 0.08 N·m over the 45°
+   flight, this corrects about ±15% of the jump energy, i.e. ±7% of the brake momentum.
+4. **Catch:** within `edge_capture` = 0.15 rad the edge LQR takes over.
+5. **If it misses:** it lands on a face (the starting face means short, the other face means
+   overshot), or it is caught and lost again within 1 s. The margin then moves by ±0.01 and
+   it tries again.
 
-| CPU load | Jumps | Brake speed | Outcome |
-|---|---|---|---|
-| Idle | 2 of 2 caught | 74.7, −75.1 rad/s | knocked over, jumped back, balanced |
-| 4 of 8 cores busy | 2 of 2 caught | 74.7, −75.0 rad/s | knocked over, jumped back, balanced |
-| 8 of 8 cores at 100% | 4 of 4 caught | 74.4–74.7 rad/s | 2 catches fell within 1 s, kept retrying, ended balanced |
+## 5. Jump-up: edge → corner, and corner balance
 
-With every core saturated the Python nodes still get starved. For real hardware, the robust
-fix is to run the balance loop on the ESP32 itself and keep ROS for supervision. That is
-now available as the on-board balance mode (`onboard:=true`, see Phase 3).
+### 5.1 The jump
 
-## Project layout
+From balance on edge *i*, the cube swings up about the horizontal axis **n** = **e**ᵢ × **r̂**⊥
+through the pivot, lifting the far end of the edge. Wheel *i* keeps balancing the edge
+throughout. The other two wheels store the jump momentum:
 
-```
-src/
-├── cubli_description/        URDF + RViz config
-│   ├── urdf/cubli_1d.urdf
-│   └── rviz/cubli.rviz
-└── cubli_control/            Python nodes
-    ├── cubli_control/
-    │   ├── model.py          nonlinear dynamics, RK4, linearisation, parameters
-    │   ├── lqr.py            discrete LQR design
-    │   ├── sensors.py        MPU6050 + encoder models (Phase 2)
-    │   ├── estimator.py      gyro calibration, complementary filter, wheel speed (Phase 2)
-    │   ├── hardware.py       serial protocol + Nidec motor model (Phase 3)
-    │   ├── onboard.py        Python twin of the ESP32's on-board estimator + LQR loop
-    │   ├── sim_node.py       simulator -> raw sensors (or the true state with sensors:=false)
-    │   ├── estimator_node.py raw sensors -> /joint_states
-    │   ├── controller_node.py  jump-up state machine + LQR -> /cubli/wheel_torque, /cubli/brake
-    │   ├── hw_driver_node.py ESP32 serial <-> raw sensors + motor commands
-    │   └── fake_esp32.py     simulated ESP32 on a virtual serial port
-    ├── config/cubli.yaml     simulation parameters
-    ├── config/cubli_hw.yaml  hardware parameters
-    ├── launch/cubli_sim.launch.py
-    ├── launch/cubli_hw.launch.py
-    └── test/                 47 offline tests (no ROS or board needed)
-firmware/cubli_esp32/         ESP32 Arduino sketch
-scripts/
-├── record_demo.py            records a live run to .npz (sim or fake ESP32)
-├── render_demo_gif.py        draws the demo GIF from a recording
-├── render_results_gif.py     draws the Phase 2 and Phase 3 result GIFs
-├── tune_controller.py        LQR + filter sweep under noise, delay and pushes
-├── confirm_tuning.py         re-runs the best tunings with 20 seeds
-└── tune_catch.py             post-jump catch study
-tuning/                       sweep and confirmation results
-media/
-├── demo_run.npz              Phase 1 recording
-├── phase2_run.npz            Phase 2 recording (estimate + ground truth)
-├── phase2_estimator.gif      rendered from phase2_run.npz
-├── phase3_passthrough.npz    Phase 3 recordings, fake ESP32 with 8 cores busy
-├── phase3_onboard.npz
-├── phase3_onboard_vs_pc.gif  rendered from the two phase3_*.npz
-├── cubli_demo.gif            rendered from demo_run.npz
-└── cubli_rviz.gif            RViz screen recording
-```
+- **Jump axis.** By the cube's symmetry, **n** is an eigenvector of Θ (for edge 1,
+  **n** = (0, −1, 1)/√2). So wheel momentum along **n** makes the body turn about **n**
+  alone, with no wobble.
+- **Required speeds.** ΔE = M g (‖**r**‖ − ‖**r**⊥‖) = 0.278 J, and with λ₀ = **n**ᵀΘ₀**n**:
 
-## Data flow
+    **ω_w** = (Θ **n** / I_w) √(2 ΔE / λ₀),  so (ω_w,j, ω_w,k) = (∓141, ±141) rad/s lossless
 
-```
- cubli_sim  ─┐  /imu/data_raw            ┌────────────────┐  /joint_states   ┌──────────────────┐
-     or      ├─ /cubli/wheel_encoder ───►│ cubli_estimator│────────────────►│ cubli_controller │
- hw_driver  ─┘                           └────────────────┘        │        └────────┬─────────┘
-     ▲                                                             ▼                 │
-     └──────────── /cubli/wheel_torque, /cubli/brake ──── robot_state_publisher ──►  │  /cubli/mode
-                                                          /tf ──► RViz               ▼
-```
+- **Spin-up while balancing:** the two wheels spin up (162 rad/s with the margins). Their
+  reaction torque lies along −**n** and presses the far vertex into the floor.
+- **Brake:** once the wheels have settled and the edge is calm (|φ| < 0.5°), both wheels are
+  braked at once. The far vertex lifts off and the cube rotates about the corner.
+- **Flight energy control** works as on the edge, about **n**:
+  E = ½ λ₀ ω_n² + M g (**r**·**u**), with wheel torques **T** = sat(k_E (E − E*) ω_n) **n**.
+- **Catch:** within `corner_capture` = 0.15 rad of corner balance the corner LQR takes over.
 
-`cubli_sim` also publishes the true state on `/cubli/ground_truth/joint_states`. With
-`sensors:=false` it publishes the true state straight to `/joint_states` and no estimator runs.
+### 5.2 Corner balance
 
-## One-time setup
+Yaw doesn't matter for balance: gravity doesn't act on it, and an IMU can't measure it.
+So the controller works with two **tilt coordinates** instead of a full attitude. At
+upright **u** = **r̂**. For unit vectors **a**, **b** ⟂ **r̂**, near upright
+**u** ≈ **r̂** + p_a**a** + p_b**b**. With **u̇** = **u** × **ω**, the linearised model in
+**z** = [p_a, p_b, **ω**, **ω_w**] ∈ ℝ⁸ is:
+
+  ṗ_a = (**a**×**r̂**)·**ω**,  ṗ_b = (**b**×**r̂**)·**ω**
+
+  Θ₀ **ω̇** = −M g ‖**r**‖ (p_a **r̂**×**a** + p_b **r̂**×**b**) − c_b **ω** + c_w **ω_w** − **T**
+
+  **ω̇_w** = (**T** − c_w **ω_w**)/I_w − **ω̇**
+
+This matches finite differences of the nonlinear model to 10⁻⁸ (tested).
+
+- **Open loop:** a pair of unstable poles at +8.24 rad/s, one per tilt direction.
+- **Controller:** a discrete LQR **T** = −K**z** with Q = diag(100, 100, 0.3 × 3, 10⁻³ × 3) and
+  R = 100·𝟙. K (3 × 8) has the cube's 3-fold symmetry.
+- **Giving up:** beyond 0.1 rad while tipping further, i.e. (**u** × **ω**)·**r̂** < 0, or
+  beyond 0.3 rad. A cube that falls off the corner lands near edge balance, and the edge
+  LQR catches it if it can.
+- **Limits:** three wheels at 0.08 N·m hold the cube statically up to 4.3–4.9° of tilt.
+  From rest the LQR catches it from up to 3.4°. On the corner it recovers from pushes up to
+  about 0.5 rad/s.
+
+## 6. Sensors, hardware noise and estimation
+
+| Source | Model | Value |
+|---|---|---|
+| Gyro | white noise + constant bias per axis | 5·10⁻⁴ rad/s (ICM-42688, ~100 Hz bandwidth); bias ~0.3–0.5°/s |
+| Accelerometer | white noise + bias, at the cube centre (feels the cube's own rotation) | 0.007 m/s²; bias 0.015–0.025 m/s² after a one-time calibration |
+| Encoders | quantised | 400 counts per turn |
+| Motor torque constant | true torque = scale × commanded | 0.95 in the ROS sim (0.90–1.05 in the Monte Carlo) |
+| Torque ripple | Gaussian | 3% of the torque + 0.5 mN·m |
+| Back-EMF | Nidec limits (section 2.5) | |
+| Brakes | efficiency per brake ~ N(η, 0.02) | η = 0.92 in the ROS sim (0.85–0.97 in the Monte Carlo) |
+| Control delay | one 5 ms step | |
+
+The controller only knows the nominal model. It sees the estimator's output, never the
+true state.
+
+**Up-vector estimator** ([estimator3d.py](src/cubli_control/cubli_control/estimator3d.py)):
+
+1. **Calibration:** with the cube still for 1 s (lying on a face, or held), average the gyro
+   for its bias and the accelerometer for the starting **u**.
+2. **Prediction:** rotate **u** by −**ω** dt (exact Rodrigues rotation).
+3. **Correction:** blend in the accelerometer direction with τ = 0.5 s. First remove the
+   IMU's own acceleration, **ω̇** × **r**_imu + **ω** × (**ω** × **r**_imu). Skip the correction
+   while ‖**f**‖ is more than 1 m/s² away from g, or the rate is above 3 rad/s (jumps,
+   landings).
+4. **Wheel speeds** come from 8-sample encoder differences.
+5. **Pose:** which vertices touch the floor comes from **u** alone (vertex *i* counts as down
+   below uᵢ < 0.05), so no contact sensor is needed.
+
+**Learning the brakes.** Each brake's efficiency is measured from the first sample where it
+shows:
+
+  η = (**a**·Θ**ω** after − **a**·Θ**ω** before − **a**·**τ**_g Δt) / (**a**·I_w Δ**ω_w**)
+
+- **a** is the jump axis: **e**ᵢ for face → edge, **n** for edge → corner.
+- **τ**_g Δt adds back the gravity impulse since the brake. Without it the estimate is
+  10–23% too low, because gravity is already slowing the jump.
+- The average of the last five brakes scales the next spin-up targets by 1/η̂. In
+  simulation it lands within ±0.01 of the true value.
+
+## 7. Results
+
+**Monte Carlo** ([scripts/monte_carlo_3d.py](scripts/monte_carlo_3d.py), raw output in
+[tuning/phase4_monte_carlo.txt](tuning/phase4_monte_carlo.txt)). There are 40 runs of
+30 s each, every one with its own hardware: torque constant 0.90–1.05, brake efficiency
+0.85–0.97 ± 0.02 per brake, and random IMU biases. Each starts lying on a face, and the
+controller knows none of this.
+
+| Result | Value |
+|---|---|
+| Balanced on the corner at the end | **40 / 40** |
+| Jumps needed (face → edge / edge → corner) | 1 / 1 in 26 runs; 2 / 1 in 13; 3 / 1 in 1. Every corner jump worked first time |
+| Time from lying on a face to balanced on the corner | median 13.6 s (8.2 s to the edge), max 29.2 s |
+| Corner tilt while balanced (true, last 3 s) | median 0.005° RMS |
+| Brake efficiency learned vs. true | within ±0.03 in every run |
+| Highest wheel speed | 264 rad/s (Nidec no-load: 600) |
+
+All the missed jumps were face → edge jumps. In 11 of the 14 runs with a miss, the brake
+was unusually good (η ≥ 0.94): against the first guess of 0.9, the jump overshot by more
+than the flight energy control can take back. The other three (η = 0.85–0.92) missed on the
+per-brake scatter. After a brake the controller knows η better, and the retry works.
+
+**ROS run** (`cubli3d_sim.launch.py`, all noise on): face → edge → corner on the first try.
+On the corner the true tilt was 0.17° RMS (settling after the catch included). A 0.3 rad/s
+push peaked at 1.0° and settled back to 0.08°. `start:=edge jump_to_corner:=false`
+balances on the edge indefinitely.
+
+**Tests:** 28 for the 3D model, contacts, brakes, controllers and the full sequence
+([test_model3d.py](src/cubli_control/test/test_model3d.py),
+[test_jump3d.py](src/cubli_control/test/test_jump3d.py)).
+
+**What limits it:** the motors. 0.08 N·m per wheel holds the 1.36 kg cube only within
+about 3.7° on an edge and 3.4–4.9° on the corner. That is why the jumps need their speed
+controlled during the flight rather than just a well-timed brake. Stronger motors, or a
+lighter cube with a lower centre of mass, would widen every margin here.
+
+## 8. How to run
+
+**One-time setup:**
 
 ```bash
 sudo apt install python3-colcon-common-extensions
 ```
 
-For hardware, also install pyserial (`sudo apt install python3-serial`; it is already on
-this machine).
+ROS Jazzy needs the system Python 3.12. If a conda env is active (`(base)` in your
+prompt), run `conda deactivate` first.
 
-**Conda warning:** ROS Jazzy needs the system Python 3.12. If a conda env is active
-(`(base)` in your prompt), run `conda deactivate` before building or running, or
-turn off auto-activation with `conda config --set auto_activate_base false`.
-
-## Build and run
+**Build** (from `cubli_ws`):
 
 ```bash
-cd cubli_ws
 colcon build --symlink-install
+```
+
+```bash
 source install/setup.bash
-ros2 launch cubli_control cubli_sim.launch.py
 ```
 
-The cube starts lying flat on a face. After 1 s the controller spins the reaction
-wheel up to about 75 rad/s and brakes it hard. The wheel's momentum flips the cube
-up onto its edge, and the LQR catches it there and keeps it balanced. If it falls
-(say after a big push), it lies still for 1 s and jumps up again.
-
-The simulator holds the cube still until the controller's first command arrives, so
-a slow controller start-up (e.g. while RViz loads) can't make it miss the cube. With sensors
-on (the default), the estimator first calibrates for 1 s while the cube lies still.
-
-Things to try in another terminal (after `source install/setup.bash`):
+**Full jump-up demo:** starts lying on a face, then goes face → edge → corner:
 
 ```bash
-ros2 topic pub --once /cubli/push std_msgs/msg/Float64 "{data: 0.5}"   # knock it
-ros2 topic pub --once /cubli/push std_msgs/msg/Float64 "{data: 6.0}"   # knock it over: it jumps back up
-ros2 service call /cubli/reset std_srvs/srv/Trigger                       # start over
-ros2 run rqt_plot rqt_plot /joint_states/position[0] /joint_states/velocity[1] /cubli/wheel_torque/data
-ros2 launch cubli_control cubli_sim.launch.py controller:=false          # no controller: stays lying down
-ros2 launch cubli_control cubli_sim.launch.py sensors:=false             # perfect state (Phase 1)
-ros2 run rqt_plot rqt_plot /joint_states/position[0] /cubli/ground_truth/joint_states/position[0]  # estimate vs truth
+ros2 launch cubli_control cubli3d_sim.launch.py
 ```
 
-Record a new demo GIF (with the launch running in another terminal):
+- In the log: `Calibrated`, then `SPIN_EDGE`, `JUMP_EDGE` (brake), `EDGE caught on edge 0`,
+  `SPIN_CORNER`, `JUMP_CORNER`, `CORNER caught on the corner`. The sim logs each brake's
+  true efficiency and every contact change.
+- RViz shows the cube (fixed frame `world`) with the three wheels spinning.
+- Add `rviz:=false` to run without RViz.
+
+**Other starts:**
 
 ```bash
-python3 scripts/record_demo.py media/demo_run.npz        # resets, jumps, pushes over, jumps again
-python3 scripts/render_demo_gif.py media/demo_run.npz media/cubli_demo.gif
+ros2 launch cubli_control cubli3d_sim.launch.py start:=edge jump_to_corner:=false
 ```
-
-Record the Phase 2 and Phase 3 result GIFs:
 
 ```bash
-# Phase 2: with cubli_sim.launch.py running
-python3 scripts/record_demo.py media/phase2_run.npz --truth --hold 2.5
-python3 scripts/render_results_gif.py estimator media/phase2_run.npz media/phase2_estimator.gif
-# Phase 3: with cubli_hw.launch.py fake_hardware:=true jump_up:=true [onboard:=true] running;
-# N is the pid the fake ESP32 prints at start-up. Load the CPU with e.g. 8 x `python3 -c 'while 1: pass'`.
-python3 scripts/record_demo.py media/phase3_onboard.npz --fake-pid N --pushes 3 --hold 3 --duration 32
-python3 scripts/render_results_gif.py compare media/phase3_passthrough.npz media/phase3_onboard.npz \
-    media/phase3_onboard_vs_pc.gif --speed 2
+ros2 launch cubli_control cubli3d_sim.launch.py start:=corner
 ```
 
-Run the offline tests:
+With `start:=edge` or `start:=corner` the cube is held still for the gyro calibration and
+then let go. `jump_to_corner:=false` keeps it on the edge.
+
+**Interact** (in a second terminal, after `source install/setup.bash`):
 
 ```bash
-cd src/cubli_control && /usr/bin/python3 -m pytest test/
+ros2 topic pub --once /cubli/push geometry_msgs/msg/Vector3 "{x: 0.3, y: 0.0, z: 0.0}"
 ```
 
-## Model
+```bash
+ros2 service call /cubli/reset std_srvs/srv/Trigger
+```
 
-Following Gajamohan et al., *The Cubli: A Cube that can Jump Up and Balance* (IROS 2012):
+```bash
+ros2 topic echo /cubli/mode
+```
 
-- θ̈_b = (M g sin θ_b − T + C_w θ̇_w − C_b θ̇_b) / I_b
-- θ̈_w = (T − C_w θ̇_w)(I_b + Θ_w) / (Θ_w I_b) − (M g sin θ_b − C_b θ̇_b) / I_b
+```bash
+ros2 run rqt_plot rqt_plot /cubli/tilt/data /cubli/ground_truth/tilt/data
+```
 
-where M = m_b·l_b + m_w·l and I_b = Θ_b + m_w·l². The parameters are the paper's
-1D prototype values (in `model.py`). Upright is open-loop unstable with a pole at about +9.9 rad/s.
+- The push is a world-frame angular velocity kick in rad/s. On the corner up to about 0.5
+  is recovered.
+- Reset puts the cube back in its start pose.
+- `/cubli/tilt` is the estimated tilt from corner balance; `/cubli/ground_truth/tilt` is the
+  true one.
 
-The LQR acts on [θ_b, θ̇_b, θ̇_w]. A small weight on wheel speed brings the wheel
-back to rest after a disturbance.
+**Tune:** [config/cubli3d.yaml](src/cubli_control/config/cubli3d.yaml) holds:
+- motor, brake and IMU noise (`cubli3d_sim`);
+- the filter (`cubli3d_estimator`);
+- the LQR weights, catch angles, jump margins and energy gain (`cubli3d_controller`).
 
-**Jump-up:** braking locks the wheel to the body. The floor reaction passes through
-the edge, so angular momentum about the edge is conserved:
-θ̇_b⁺ = Θ_w ω_w / (I_b + Θ_w). To lift the centre of mass from 45° to upright,
-the wheel needs ω_w = √(2 M g (1 − cos 45°)(I_b + Θ_w)) / Θ_w ≈ 68 rad/s.
-The controller aims 10% higher (`jump_margin`) and adds 5% after each failed try.
-Set `brake_efficiency` below 1 in the sim to model a lossy real brake.
-The controller's mode sequence is FALLEN → SPIN_UP → JUMPING → BALANCE.
+**Offline tools:**
 
-## Roadmap
+```bash
+cd src/cubli_control && /usr/bin/python3 -m pytest test/test_model3d.py test/test_jump3d.py
+```
 
-1. ✅ **Phase 1:** 1D Cubli in simulation: LQR edge balancing, plus jump-up by wheel braking
-   and switching to the balancing controller (results above)
-2. ✅ **Phase 2:** sensor realism: MPU6050 noise/bias + encoder quantisation, gyro calibration
-   and a complementary filter (results above)
-3. 🚧 **Phase 3:** hardware: ESP32 firmware + serial driver for MPU6050 and Nidec 24H. Software
-   is done and tested against a fake ESP32; next comes building the cube, bring-up, and
-   measuring its parameters.
-4. 3D Cubli: corner balancing with three wheels (Gazebo / MuJoCo sim, ros2_control)
+```bash
+python3 scripts/monte_carlo_3d.py 40
+```
+
+```bash
+python3 scripts/render_phase4_gif.py media/cubli3d_jump_up.gif
+```
+
+**Topics:**
+
+| Topic | From → to | Content |
+|---|---|---|
+| `/imu/data_raw` | sim → estimator | gyro + accelerometer, body axes |
+| `/cubli/wheel_encoders` | sim → estimator | quantised wheel angles |
+| `/cubli/state_estimate` | estimator → controller | up vector, body rate, wheel speeds |
+| `/cubli/wheel_torques` | controller → sim | 3 torques [N·m] |
+| `/cubli/brake` | controller → sim | wheels to brake |
+| `/cubli/mode`, `/cubli/tilt` | controller | mode, estimated tilt |
+| `/tf` world → cube, `/joint_states` | sim → RViz | true attitude and wheel angles |
+
+## 9. Project layout
+
+```
+src/cubli_description/
+├── urdf/cubli_3d.urdf          cube, pivot and the three wheels
+└── rviz/cubli3d.rviz
+src/cubli_control/
+├── cubli_control/
+│   ├── model3d.py              corner dynamics, parameters, motor limits, linearisation, corner LQR
+│   ├── contact3d.py            face / edge / corner contact, lift-off, landing, brakes
+│   ├── control3d.py            edge LQR, jump state machine, flight energy control, brake learning
+│   ├── sensors3d.py            ICM-42688 IMU + encoder models
+│   ├── estimator3d.py          up-vector estimator + wheel speeds
+│   ├── sim3d.py                simulator core (plant + noise) and the offline closed loop
+│   ├── sim3d_node.py           ROS: simulator
+│   ├── estimator3d_node.py     ROS: estimator
+│   └── controller3d_node.py    ROS: controller
+├── config/cubli3d.yaml
+├── launch/cubli3d_sim.launch.py
+└── test/test_model3d.py, test/test_jump3d.py
+scripts/monte_carlo_3d.py       robustness study
+scripts/render_phase4_gif.py    the GIF above
+```
+
+The package still contains the 1D Cubli code (`sim_node`, `controller_node`,
+`hw_driver_node`, the ESP32 sketch in `firmware/`, …). It is documented in the
+[1D repository](https://github.com/nht-cyb/ros2-1dim-balancing-cube).
+
+**Next:** an ESP32 with three Nidec channels and three brakes, the ICM-42688 over SPI, and
+the edge/corner balance loop running on the board. Then bring-up, and measuring the
+masses, inertias, motor constants and brake efficiency marked MEASURE.

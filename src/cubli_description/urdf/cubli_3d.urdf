@@ -1,0 +1,94 @@
+<?xml version="1.0"?>
+<!--
+  3D Cubli: a 15 cm cube that balances on one corner using three reaction wheels.
+
+  Frame "cube" sits on the pivot corner with its axes along the three edges that meet
+  there; the cube fills [0, 0.15]^3. The simulator broadcasts world -> cube (the true
+  attitude), so this model needs no floating joint.
+  wheel_{x,y,z}_joint : rotation of each wheel relative to the cube, about its body axis.
+  Wheel i is centred 63 mm from the cube centre towards the face at the pivot, so the
+  three 58 mm wheels clear each other by 5 mm.
+
+  Geometry here is for visualisation; the dynamics parameters live in
+  cubli_control/model3d.py.
+-->
+<robot name="cubli_3d">
+
+  <material name="frame_grey"><color rgba="0.75 0.75 0.78 0.35"/></material>
+  <material name="wheel_blue"><color rgba="0.15 0.35 0.85 1.0"/></material>
+  <material name="wheel_green"><color rgba="0.15 0.65 0.35 1.0"/></material>
+  <material name="wheel_red"><color rgba="0.8 0.25 0.2 1.0"/></material>
+  <material name="marker_orange"><color rgba="1.0 0.55 0.1 1.0"/></material>
+  <material name="pivot_red"><color rgba="0.85 0.1 0.1 1.0"/></material>
+
+  <link name="cube">
+    <visual>
+      <origin xyz="0.075 0.075 0.075" rpy="0 0 0"/>
+      <geometry><box size="0.15 0.15 0.15"/></geometry>
+      <material name="frame_grey"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><sphere radius="0.006"/></geometry>
+      <material name="pivot_red"/>
+    </visual>
+  </link>
+
+  <link name="wheel_x">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.058" length="0.010"/></geometry>
+      <material name="wheel_red"/>
+    </visual>
+    <visual>
+      <origin xyz="0.006 0 0.029" rpy="0 0 0"/>
+      <geometry><box size="0.003 0.010 0.058"/></geometry>
+      <material name="marker_orange"/>
+    </visual>
+  </link>
+  <joint name="wheel_x_joint" type="continuous">
+    <parent link="cube"/>
+    <child link="wheel_x"/>
+    <origin xyz="0.012 0.075 0.075" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+  </joint>
+
+  <link name="wheel_y">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.570796 0 0"/>
+      <geometry><cylinder radius="0.058" length="0.010"/></geometry>
+      <material name="wheel_green"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0.006 0.029" rpy="0 0 0"/>
+      <geometry><box size="0.010 0.003 0.058"/></geometry>
+      <material name="marker_orange"/>
+    </visual>
+  </link>
+  <joint name="wheel_y_joint" type="continuous">
+    <parent link="cube"/>
+    <child link="wheel_y"/>
+    <origin xyz="0.075 0.012 0.075" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <link name="wheel_z">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.058" length="0.010"/></geometry>
+      <material name="wheel_blue"/>
+    </visual>
+    <visual>
+      <origin xyz="0.029 0 0.006" rpy="0 0 0"/>
+      <geometry><box size="0.058 0.010 0.003"/></geometry>
+      <material name="marker_orange"/>
+    </visual>
+  </link>
+  <joint name="wheel_z_joint" type="continuous">
+    <parent link="cube"/>
+    <child link="wheel_z"/>
+    <origin xyz="0.075 0.075 0.012" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+
+</robot>

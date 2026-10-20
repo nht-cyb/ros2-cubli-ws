@@ -9,12 +9,13 @@ def spin_until_shutdown(node):
     """Spin until Ctrl+C / SIGTERM, without a traceback on the shutdown race.
 
     If the signal lands while spin() is building its next wait set, rclpy raises a plain
-    RCLError instead of ExternalShutdownException; that is a normal shutdown too.
+    RCLError (or a pybind11 RuntimeError) instead of ExternalShutdownException; that is a
+    normal shutdown too.
     """
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
-    except RCLError:
+    except (RCLError, RuntimeError):
         if node.context.ok():
             raise

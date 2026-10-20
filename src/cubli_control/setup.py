@@ -18,7 +18,7 @@ setup(
     zip_safe=True,
     maintainer='ryuzuu',
     maintainer_email='htrang.cyb@gmail.com',
-    description='Simulator, state estimator, ESP32 hardware driver and jump-up/LQR controller for a 1D Cubli.',
+    description='Simulators, state estimators, ESP32 hardware driver and LQR controllers for a 1D and a 3D Cubli.',
     license='MIT',
     tests_require=['pytest'],
     entry_points={
@@ -28,6 +28,9 @@ setup(
             'estimator_node = cubli_control.estimator_node:main',
             'hw_driver_node = cubli_control.hw_driver_node:main',
             'fake_esp32 = cubli_control.fake_esp32:main',
+            'sim3d_node = cubli_control.sim3d_node:main',
+            'estimator3d_node = cubli_control.estimator3d_node:main',
+            'controller3d_node = cubli_control.controller3d_node:main',
         ],
     },
 )

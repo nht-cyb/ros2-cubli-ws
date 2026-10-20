@@ -1,0 +1,72 @@
+# 3D Cubli in simulation, modelled on this build's hardware:
+# three Nidec 24H reaction wheels with brakes and one ICM-42688-class IMU at the cube centre.
+# Values marked MEASURE are placeholders until the real cube is weighed and tested.
+
+cubli3d_sim:
+  ros__parameters:
+    rate_hz: 200.0
+    substeps: 2               # RK4 substeps per 5 ms period (2.5 ms)
+    start: face               # face (jump-up demo) | edge | corner (held there by "hand")
+    start_tilt: 0.03          # rad, for edge / corner starts
+    hold_time: 2.0            # s held still after /cubli/reset (edge / corner starts)
+    command_timeout: 0.1      # s, zero torque if the controller goes quiet
+    start_timeout: 5.0        # s, let go after this even without a controller
+    seed: 0                   # noise seed
+    # Motors (Nidec 24H) and their non-idealities; the controller assumes the nominal model.
+    max_torque: 0.08          # N m per wheel
+    stall_torque: 0.10        # MEASURE: N m at full effort, wheel stopped
+    no_load_speed: 600.0      # MEASURE: rad/s at full effort, no load
+    torque_scale: 0.95        # true torque / commanded (motor constant 5% weaker than assumed)
+    torque_noise_rel: 0.03    # torque ripple, x |torque|
+    torque_noise_abs: 5.0e-4  # N m
+    # Brakes (one per wheel): fraction of the wheel momentum handed to the body
+    brake_efficiency: 0.92    # MEASURE
+    brake_efficiency_std: 0.02
+    # ICM-42688-class IMU at the cube centre (pivot -> IMU, body frame)
+    imu_position: [0.075, 0.075, 0.075]
+    gyro_noise_std: 5.0e-4    # rad/s per sample (2.8 mdps/sqrt(Hz), ~100 Hz bandwidth)
+    gyro_bias: [0.006, -0.004, 0.008]     # rad/s, removed by the start-up calibration
+    accel_noise_std: 0.007    # m/s^2 per sample (70 ug/sqrt(Hz))
+    accel_bias: [0.02, -0.015, 0.025]     # m/s^2, left after a one-time calibration
+    encoder_cpr: 400          # counts per wheel turn
+
+cubli3d_estimator:
+  ros__parameters:
+    time_constant: 0.5        # s, complementary filter
+    imu_position: [0.075, 0.075, 0.075]
+    calib_samples: 200        # 1 s still at start-up
+    wheel_speed_window: 8
+
+cubli3d_controller:
+  ros__parameters:
+    rate_hz: 200.0
+    max_torque: 0.08
+    # Edge balance: 1D LQR about the edge with the wheel along it
+    edge_q: [100.0, 0.3, 1.0e-4]   # tilt, rate, wheel speed
+    edge_r: 100.0
+    edge_catch: 0.4           # rad: catch a cube moving towards edge balance
+    edge_capture: 0.15        # rad: LQR takes over from the jump's energy control
+    edge_disengage: 0.16      # rad: give up beyond this while tipping further
+    # Corner balance: 3D LQR with all three wheels
+    corner_q: [100.0, 0.3, 1.0e-3]
+    corner_r: 100.0
+    corner_catch: 0.25
+    corner_capture: 0.15
+    corner_disengage: 0.1
+    corner_give_up: 0.3
+    # Jump-up
+    jump_to_edge: true
+    jump_to_corner: true
+    rest_time: 1.0            # s still / balanced before a jump
+    spin_torque: 0.03         # N m, gentle spin-up
+    spin_gain: 0.01           # N m per rad/s
+    spin_tolerance: 2.0       # rad/s
+    spin_settle_time: 0.15    # s
+    spin_timeout: 10.0        # s
+    edge_margin: 1.04         # x the lossless face -> edge wheel speed
+    corner_margin: 1.03       # x the lossless edge -> corner wheel speeds
+    margin_step: 0.01         # after a short / overshot jump
+    brake_efficiency: 0.9     # first guess; measured after every brake
+    energy_gain: 5.0          # flight energy control
+    jump_timeout: 1.5         # s
+    floor_eps: 0.05           # vertex counts as on the floor below 0.05 x side
