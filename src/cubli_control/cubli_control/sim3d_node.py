@@ -1,6 +1,7 @@
 """Physics simulator for the 3D Cubli: lying on a face, balancing on an edge or on the corner.
 
-Subscribes:  /cubli/wheel_torques (std_msgs/Float64MultiArray)  3 motor torques [N m]
+Subscribes:  /cubli/wheel_torques (std_msgs/Float64MultiArray)  3 motor torques [N m], and
+                                       optionally the stamp of the sample they answer
              /cubli/brake         (std_msgs/Int32MultiArray)    wheels to brake now (0, 1, 2)
              /cubli/push          (geometry_msgs/Vector3)  kick: adds this world-frame
                                                            angular velocity [rad/s]
@@ -10,6 +11,13 @@ Publishes:   /imu/data_raw         (sensor_msgs/Imu)         noisy ICM-42688-cla
              /joint_states         (sensor_msgs/JointState)  true wheel angles (for RViz)
              /tf                   world -> cube (true attitude, frame at the pivot corner)
              /cubli/ground_truth/tilt (std_msgs/Float64)     true tilt from corner balance [rad]
+
+Lockstep (default): after publishing a sample, the sim waits until the controller has
+answered that sample (its torque message carries the sample's stamp) before taking the
+next 5 ms step, at most 200 steps per second and with a 50 ms timeout. So the loop always
+has exactly one step of delay, as on the real cube's microcontroller, however busy the PC
+is; a busy PC only makes the simulation run slower than real time. Sensor data is stamped
+with simulation time (start-up wall time + sim time); TF with the wall clock, for RViz.
 
 The plant is cubli_control.sim3d: contact physics (contact3d), Nidec motors with torque
 error and ripple, lossy brakes, IMU and encoder models. Starting on an edge or the corner,
@@ -29,7 +37,7 @@ from tf2_ros import TransformBroadcaster
 from cubli_control import contact3d
 from cubli_control.model3d import (
     Cubli3DParams, initial_state, quat_to_matrix, tilt_angle, up_in_body)
-from cubli_control.ros_utils import spin_until_shutdown
+from cubli_control.ros_utils import spin_until_shutdown, warn_if_shared
 from cubli_control.sensors3d import Sensor3DParams
 from cubli_control.sim3d import HardwareNoise, Simulator
 
@@ -62,6 +70,8 @@ class Cubli3DSim(Node):
         self.declare_parameter('accel_bias', list(sensors.accel_bias))
         self.declare_parameter('encoder_cpr', sensors.encoder_cpr)
         self.declare_parameter('seed', 0)
+        self.declare_parameter('lockstep', True)
+        self.declare_parameter('lockstep_timeout', 0.05)
 
         gp = lambda name: self.get_parameter(name).value  # noqa: E731
         self.p = Cubli3DParams(max_torque=gp('max_torque'), stall_torque=gp('stall_torque'),
@@ -78,6 +88,11 @@ class Cubli3DSim(Node):
         self.timeout = gp('command_timeout')
         self.hold_time = gp('hold_time')
         self.start_timeout = gp('start_timeout')
+        self.lockstep = bool(gp('lockstep'))
+        self.lockstep_timeout = gp('lockstep_timeout')
+        self.answered = None           # stamp of the sample the last command answered
+        self.published = None          # (stamp, wall time) of the last published sample
+        self.lag_reported = 1.0
 
         self.command = np.zeros(3)
         self.pending_brake = []
@@ -95,7 +110,9 @@ class Cubli3DSim(Node):
         self.create_subscription(Int32MultiArray, 'cubli/brake', self.on_brake, 10)
         self.create_subscription(Vector3, 'cubli/push', self.on_push, 10)
         self.create_service(Trigger, 'cubli/reset', self.on_reset)
-        self.create_timer(1.0 / self.rate, self.step)
+        self.t_stamp0 = None           # wall time at sim time 0: sensor stamps = this + sim t
+        self.create_timer(1.0 / self.rate, self.tick)
+        warn_if_shared(self, ['imu/data_raw', 'cubli/wheel_torques'])
         self.get_logger().info(
             f'3D Cubli sim at {self.rate:.0f} Hz: {self.p.mass:.2f} kg, start on a '
             f'{gp("start")}, max wheel torque {self.p.max_torque} N m, brake efficiency '
@@ -114,15 +131,19 @@ class Cubli3DSim(Node):
 
     def reset_sim(self):
         x0, needs_hold = self.start_state()
+        t0 = self.sim.t if hasattr(self, 'sim') else 0.0   # keep the clock running on reset
         self.sim = Simulator(x0, p=self.p, sensors=self.sensor_params, noise=self.noise,
                              rate_hz=self.rate, substeps=int(self.get_parameter('substeps').value),
                              seed=int(self.get_parameter('seed').value))
+        self.sim.t = t0
         self.needs_hold = needs_hold
 
     def on_torques(self, msg: Float64MultiArray):
-        if len(msg.data) != 3:
+        if len(msg.data) not in (3, 4):
             return
-        self.command = np.array(msg.data, float)
+        self.command = np.array(msg.data[0:3], float)
+        if len(msg.data) == 4:
+            self.answered = float(msg.data[3])
         self.last_cmd = self.now()
         if self.hold_until is None:
             self.hold_until = self.now()
@@ -150,9 +171,28 @@ class Cubli3DSim(Node):
         response.message = 'Reset to the start pose'
         return response
 
-    def step(self):
+    def tick(self):
+        """One sim step per tick, once the controller has answered the last sample."""
         if not self.context.ok():
             return
+        now = self.now()
+        if self.t_stamp0 is None:
+            self.t_stamp0 = now - self.sim.t
+        if self.lockstep and self.answered is not None and self.published is not None:
+            stamp, wall = self.published
+            if self.answered < stamp - 1e-6:          # still waiting for the controller
+                if now - wall < self.lockstep_timeout:
+                    return
+                self.get_logger().warn('Controller late; stepping without its answer',
+                                       throttle_duration_sec=10.0)
+        lag = now - self.t_stamp0 - self.sim.t
+        if lag > self.lag_reported:
+            self.get_logger().info(f'Simulation {lag:.1f} s behind the wall clock (busy PC); '
+                                   'it runs slower than real time but stays exact')
+            self.lag_reported = lag + 5.0
+        self.step()
+
+    def step(self):
         sim = self.sim
         if self.hold_until is None and self.now() - self.start_time > self.start_timeout:
             self.hold_until = self.now()
@@ -175,10 +215,12 @@ class Cubli3DSim(Node):
 
     def publish(self):
         sim = self.sim
-        stamp = self.get_clock().now().to_msg()
+        t_sample = self.t_stamp0 + sim.t
+        stamp = rclpy.time.Time(seconds=t_sample).to_msg()   # simulation time
+        self.published = (stamp.sec + stamp.nanosec * 1e-9, self.now())
         q = sim.x[0:4]
         tf = TransformStamped()
-        tf.header.stamp = stamp
+        tf.header.stamp = self.get_clock().now().to_msg()   # wall clock, for RViz
         tf.header.frame_id = 'world'
         tf.child_frame_id = 'cube'
         tf.transform.rotation.w, tf.transform.rotation.x = float(q[0]), float(q[1])

@@ -36,7 +36,11 @@ def generate_launch_description():
         Node(
             package='robot_state_publisher',
             executable='robot_state_publisher',
+            name='cubli3d_state_publisher',
             parameters=[{'robot_description': robot_description}],
+            # Its own topic, so a 1D Cubli (or any robot) still running in this ROS domain
+            # can't hand RViz the wrong model.
+            remappings=[('robot_description', 'cubli3d/robot_description')],
         ),
         Node(
             package='cubli_control',

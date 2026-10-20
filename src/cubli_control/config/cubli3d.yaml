@@ -57,7 +57,10 @@ cubli3d_controller:
     # Jump-up
     jump_to_edge: true
     jump_to_corner: true
-    rest_time: 1.0            # s still / balanced before a jump
+    rest_time: 1.0            # s lying still before a face -> edge jump
+    edge_rest_time: 2.0       # s balanced on the edge before the corner jump
+    retry_backoff: 1.0        # s of extra rest per failed jump in a row ...
+    max_rest_time: 5.0        # ... up to this
     spin_torque: 0.03         # N m, gentle spin-up
     spin_gain: 0.01           # N m per rad/s
     spin_tolerance: 2.0       # rad/s

@@ -19,3 +19,17 @@ def spin_until_shutdown(node):
     except (RCLError, RuntimeError):
         if node.context.ok():
             raise
+
+
+def warn_if_shared(node, topics):
+    """Log an error while another node also publishes one of `topics` (e.g. a second
+    Cubli launch in the same ROS domain): their data would mix and the cube misbehave."""
+    def check():
+        for topic in topics:
+            count = node.count_publishers(topic)
+            if count > 1:
+                node.get_logger().error(
+                    f'{count} publishers on {topic}: another Cubli launch is running in this '
+                    'ROS domain, so the two mix their data. Stop the other one, or give each '
+                    'its own ROS_DOMAIN_ID.', throttle_duration_sec=10.0)
+    return node.create_timer(2.0, check)

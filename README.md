@@ -4,13 +4,13 @@ A 15 cm cube with three reaction wheels. Lying flat on a face, it **jumps onto a
 balances there, jumps onto a corner and balances on the corner**, using only its wheels
 and their brakes.
 
-![3D Cubli: lying on a face, jumping onto an edge, then onto the corner, then pushed](media/cubli3d_jump_up.gif)
+![3D Cubli in RViz: lying on a face, jumping onto an edge, then onto the corner](media/cubli3d_rviz.gif)
 
-*Simulation with all noise sources on. It lies on a face (gyro calibration), spins the
-x wheel up and brakes it, and lands balanced on the edge. While still balancing on the
-edge, it spins the y and z wheels up and brakes both, and swings up onto the corner. Then
-it is pushed. Right: the centre-of-mass height (face 66 mm, edge 93 mm, corner 114 mm)
-and the three wheel speeds. Played at 2× speed.*
+*RViz screen recording of `ros2 launch cubli_control cubli3d_sim.launch.py`, all noise
+sources on, real time. It lies on a face (gyro calibration), spins the red x wheel up and
+brakes it, and lands balanced on the edge. While still balancing on the edge, it spins the
+green and blue wheels up and brakes both, and swings up onto the corner, where it
+balances.*
 
 | Stage | What | Status |
 |---|---|---|
@@ -278,6 +278,13 @@ shows:
 
 ## 7. Results
 
+![3D Cubli jump-up with centre-of-mass height and wheel speeds](media/cubli3d_jump_up.gif)
+
+*The same sequence from the offline closed loop
+([scripts/render_phase4_gif.py](scripts/render_phase4_gif.py)), with a push at the end. Right:
+the centre-of-mass height (face 66 mm, edge 93 mm, corner 114 mm) and the three wheel
+speeds. Played at 2× speed.*
+
 **Monte Carlo** ([scripts/monte_carlo_3d.py](scripts/monte_carlo_3d.py), raw output in
 [tuning/phase4_monte_carlo.txt](tuning/phase4_monte_carlo.txt)). There are 40 runs of
 30 s each, every one with its own hardware: torque constant 0.90–1.05, brake efficiency
@@ -298,10 +305,11 @@ was unusually good (η ≥ 0.94): against the first guess of 0.9, the jump overs
 than the flight energy control can take back. The other three (η = 0.85–0.92) missed on the
 per-brake scatter. After a brake the controller knows η better, and the retry works.
 
-**ROS run** (`cubli3d_sim.launch.py`, all noise on): face → edge → corner on the first try.
-On the corner the true tilt was 0.17° RMS (settling after the catch included). A 0.3 rad/s
-push peaked at 1.0° and settled back to 0.08°. `start:=edge jump_to_corner:=false`
-balances on the edge indefinitely.
+**ROS run with RViz** (`cubli3d_sim.launch.py`, all noise on): face → edge → corner on the
+first try. It balanced 2 s on the edge before the corner jump. On the corner the true tilt
+was 0.12° RMS (settling after the catch included). A 0.3 rad/s push peaked at 1.06° and
+settled back to 0.004°. `start:=edge jump_to_corner:=false` balances on the edge
+indefinitely.
 
 **Tests:** 28 for the 3D model, contacts, brakes, controllers and the full sequence
 ([test_model3d.py](src/cubli_control/test/test_model3d.py),
@@ -340,10 +348,22 @@ ros2 launch cubli_control cubli3d_sim.launch.py
 ```
 
 - In the log: `Calibrated`, then `SPIN_EDGE`, `JUMP_EDGE` (brake), `EDGE caught on edge 0`,
-  `SPIN_CORNER`, `JUMP_CORNER`, `CORNER caught on the corner`. The sim logs each brake's
-  true efficiency and every contact change.
-- RViz shows the cube (fixed frame `world`) with the three wheels spinning.
+  2 s of edge balance, `SPIN_CORNER`, `JUMP_CORNER`, `CORNER caught on the corner`. The
+  sim logs each brake's true efficiency and every contact change.
+- If a jump misses, the cube rests 1 s longer before each retry (up to 5 s), so it backs
+  off instead of looping.
+- RViz shows the cube (fixed frame `world`) with the three wheels spinning. The model
+  comes from its own topic, `/cubli3d/robot_description`, so a leftover 1D Cubli or other
+  robot in the same ROS domain can't replace it.
 - Add `rviz:=false` to run without RViz.
+
+**Run one Cubli launch at a time** (per ROS domain). Two launches mix each other's sensor
+data and torque commands, and the cube jumps around unphysically. Each node logs
+`… publishers on …: another Cubli launch is running` when that happens. Stop the other
+launch with Ctrl+C, or give each launch its own domain, e.g. `ROS_DOMAIN_ID=5 ros2 launch …`.
+The 3D simulation also needs some free CPU, because the balance loop runs through ROS at
+200 Hz. The sim stamps its data with simulation time, catches up after late timer ticks,
+and warns `Simulation … behind the wall clock` when the PC can't keep up even so.
 
 **Other starts:**
 
@@ -434,7 +454,7 @@ src/cubli_control/
 ├── launch/cubli3d_sim.launch.py
 └── test/test_model3d.py, test/test_jump3d.py
 scripts/monte_carlo_3d.py       robustness study
-scripts/render_phase4_gif.py    the GIF above
+scripts/render_phase4_gif.py    the results GIF (section 7)
 ```
 
 The package still contains the 1D Cubli code (`sim_node`, `controller_node`,

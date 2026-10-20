@@ -1,7 +1,8 @@
 """3D Cubli controller: edge balance, jump-up face -> edge -> corner, corner balance.
 
 Subscribes:  /cubli/state_estimate (std_msgs/Float64MultiArray)  see estimator3d_node.py
-Publishes:   /cubli/wheel_torques  (std_msgs/Float64MultiArray)  3 motor torques [N m]
+Publishes:   /cubli/wheel_torques  (std_msgs/Float64MultiArray)  3 motor torques [N m] + the
+                                     stamp of the estimate they answer
              /cubli/brake          (std_msgs/Int32MultiArray)    wheels to brake (jumps)
              /cubli/tilt           (std_msgs/Float64)  estimated tilt from corner balance [rad]
              /cubli/mode           (std_msgs/String, latched)
@@ -19,7 +20,7 @@ from std_msgs.msg import Float64, Float64MultiArray, Int32MultiArray, String
 
 from cubli_control.control3d import ControlParams, JumpBalanceController
 from cubli_control.model3d import Cubli3DParams, tilt_angle
-from cubli_control.ros_utils import spin_until_shutdown
+from cubli_control.ros_utils import spin_until_shutdown, warn_if_shared
 
 TUPLES = ('edge_q', 'corner_q')
 
@@ -49,17 +50,21 @@ class Controller3D(Node):
             String, 'cubli/mode', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.logged = 0
         self.create_subscription(Float64MultiArray, 'cubli/state_estimate', self.on_state, 10)
+        warn_if_shared(self, ['cubli/wheel_torques', 'cubli/brake'])
 
     def on_state(self, msg: Float64MultiArray):
-        if len(msg.data) != 9:
+        if len(msg.data) not in (9, 10):
             return
         data = np.array(msg.data)
         up, rate, wheels = data[0:3], data[3:6], data[6:9]
-        t = self.get_clock().now().nanoseconds * 1e-9
+        # The sample's own stamp (simulation / sensor time), so timers and the brake
+        # measurement don't depend on when this callback happens to run.
+        t = data[9] if len(data) == 10 else self.get_clock().now().nanoseconds * 1e-9
         torque, brake = self.ctrl.step(t, up, rate, wheels)
         if brake:
             self.brake_pub.publish(Int32MultiArray(data=[int(i) for i in brake]))
-        self.torque_pub.publish(Float64MultiArray(data=[float(v) for v in torque]))
+        # The sample's stamp goes along, so a lockstep simulator knows this answers it.
+        self.torque_pub.publish(Float64MultiArray(data=[float(v) for v in torque] + [float(t)]))
         self.tilt_pub.publish(Float64(data=tilt_angle(self.p, up)))
         for _, mode, note in self.ctrl.log[self.logged:]:
             self.mode_pub.publish(String(data=mode))

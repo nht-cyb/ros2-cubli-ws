@@ -6,12 +6,13 @@ three wheel speeds. Which vertices touch the floor follows from u (vertex i is a
 side * u_i), so the pose is known without any contact sensor.
 
 Modes:
-  FACE           lying on a face. After rest_time still, pick a floor edge i and spin wheel i
+  FACE           lying on a face. After rest_time still (longer after failed jumps: it
+                 backs off instead of looping), pick a floor edge i and spin wheel i
                  to the face -> edge jump speed (its reaction presses the cube into the floor)
   SPIN_EDGE      spinning up; brake once the speed has held for spin_settle_time
   JUMP_EDGE      wheel i braked: the cube flips onto edge i; the edge LQR takes over within
                  edge_catch of balance
-  EDGE           balancing on edge i with wheel i (1D LQR about the edge). After rest_time
+  EDGE           balancing on edge i with wheel i (1D LQR about the edge). After edge_rest_time
                  it starts SPIN_CORNER (if jump_to_corner)
   SPIN_CORNER    still balancing with wheel i, the two other wheels spin up so that their
                  combined momentum lies along the corner-jump axis
@@ -63,7 +64,10 @@ class ControlParams:
     # Jumps
     jump_to_edge: bool = True
     jump_to_corner: bool = True
-    rest_time: float = 1.0                  # s still (FACE) / balanced (EDGE) before a jump
+    rest_time: float = 1.0                  # s lying still before a face -> edge jump
+    edge_rest_time: float = 2.0             # s balanced on the edge before the corner jump
+    retry_backoff: float = 1.0              # extra rest [s] per failed jump in a row ...
+    max_rest_time: float = 5.0              # ... up to this
     spin_torque: float = 0.03               # N m, gentle spin-up
     spin_gain: float = 0.01                 # N m per rad/s of speed error
     spin_tolerance: float = 2.0             # rad/s
@@ -141,6 +145,7 @@ class JumpBalanceController:
         self.still_since = None
         self.airborne = False         # the jump has left its starting pose
         self.corner_jumped = False    # CORNER was entered from a corner jump
+        self.failures = 0             # failed jumps in a row (for the retry back-off)
         self.jump_side = None         # sign of the edge tilt the last face -> edge jump started at
         self.brake_efficiency = self.c.brake_efficiency
         self.brake_seen = []          # measured efficiencies
@@ -152,6 +157,11 @@ class JumpBalanceController:
         self.t = 0.0
 
     # ---- helpers -------------------------------------------------------------------
+    def rest_needed(self) -> float:
+        """Rest before the next jump: longer after each failed jump in a row."""
+        c = self.c
+        return min(c.rest_time + c.retry_backoff * self.failures, c.max_rest_time)
+
     def set_mode(self, mode, t, note=''):
         if mode != self.mode:
             self.mode, self.since, self.note = mode, t, note
@@ -288,7 +298,7 @@ class JumpBalanceController:
                 self.try_catch(u, w, t, 'caught')
             elif self.still_since is None:
                 self.still_since = t
-            elif c.jump_to_edge and t - self.still_since > c.rest_time:
+            elif c.jump_to_edge and t - self.still_since > self.rest_needed():
                 face_up = 3 - sum(down)
                 self.edge = min(down)
                 phi = edge_angle(self.p, self.edge, u)
@@ -325,9 +335,11 @@ class JumpBalanceController:
                 else:
                     if set(which) == set(self.jump_face):
                         self.edge_margin += c.margin_step
+                        self.failures += 1
                         note = 'fell short'
                     else:
                         self.edge_margin -= c.margin_step
+                        self.failures += 1
                         note = 'overshot'
                     self.set_mode(FACE, t, f'{note}; edge margin now {self.edge_margin:.2f}')
                     self.try_catch(u, w, t, 'caught after the edge jump')
@@ -343,6 +355,7 @@ class JumpBalanceController:
                     # the side it came from means it was short.
                     short = math.copysign(1.0, phi) == self.jump_side
                     self.edge_margin += c.margin_step if short else -c.margin_step
+                    self.failures += 1
                     note = (f' ({"short" if short else "overshot"}; edge margin now '
                             f'{self.edge_margin:.2f})')
                 self.jump_side = None
@@ -351,8 +364,10 @@ class JumpBalanceController:
                 others = [j for j in range(3) if j != i]
                 if self.mode == EDGE:
                     torque = self.speed_loop(wheels, np.zeros(3))
-                    if c.jump_to_corner and t - self.since > c.rest_time:
+                    if c.jump_to_corner and t - self.since > max(c.edge_rest_time,
+                                                                 self.rest_needed()):
                         self.jump_side = None
+                        self.failures = 0     # the edge balance held
                         self.target = (self.corner_margin * corner_jump_speeds(self.p, i)
                                        / self.brake_efficiency)
                         self.set_mode(SPIN_CORNER, t, 'wheel targets '
@@ -381,9 +396,11 @@ class JumpBalanceController:
             elif self.airborne and kind != 'corner':
                 if kind == 'edge' and which == self.edge:
                     self.corner_margin += c.margin_step
+                    self.failures += 1
                     note = 'fell short'
                 else:
                     self.corner_margin -= c.margin_step
+                    self.failures += 1
                     note = 'overshot'
                 self.set_mode(FACE, t, f'{note}; corner margin now {self.corner_margin:.2f}')
                 self.try_catch(u, w, t, 'caught after the corner jump')
@@ -401,11 +418,14 @@ class JumpBalanceController:
                     r_perp = edge_frame(self.p, self.edge)[0]
                     short = u @ r_perp > self.r_hat @ r_perp
                     self.corner_margin += c.margin_step if short else -c.margin_step
+                    self.failures += 1
                     note = (f' ({"short" if short else "overshot"}; corner margin now '
                             f'{self.corner_margin:.2f})')
                 self.corner_jumped = False
                 self.set_mode(FACE, t, f'lost corner balance at {math.degrees(tilt):.1f} deg{note}')
             else:
                 torque = -(self.k_corner @ state_vector(self.p, u, w, wheels))
+                if t - self.since > 2.0:
+                    self.failures = 0
 
         return np.clip(torque, -c.max_torque, c.max_torque), brake
